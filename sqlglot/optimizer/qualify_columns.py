@@ -63,6 +63,7 @@ def qualify_columns(
         if schema.empty and expand_alias_refs:
             _expand_alias_refs(scope, resolver)
 
+        _convert_columns_to_dots(scope, resolver)
         _qualify_columns(scope, resolver)
 
         if not schema.empty and expand_alias_refs:
@@ -329,6 +330,44 @@ def _select_by_pos(scope: Scope, node: exp.Literal) -> exp.Alias:
         raise OptimizeError(f"Unknown output column: {node.name}")
 
 
+def _convert_columns_to_dots(scope: Scope, resolver: Resolver) -> None:
+    """
+    Converts `Column` instances that represent struct field lookup into chained `Dots`.
+
+    Structs field lookups look like columns (e.g. "struct"."field"), but they need to be
+    qualified separately and represented as Dot(Dot(...(<table>.<column>, field1), field2, ...)).
+    """
+    converted = False
+    for column in itertools.chain(scope.columns, scope.stars):
+        column_table = column.table
+        if (
+            column_table
+            and column_table not in scope.sources
+            and (
+                not scope.parent
+                or column_table not in scope.parent.sources
+                or not scope.is_correlated_subquery
+            )
+        ):
+            root, *parts = column.parts
+
+            if root.name in scope.sources:
+                # The struct is already qualified, but we still need to change the AST
+                column_table = root
+                root, *parts = parts
+            else:
+                column_table = resolver.get_table(root.name)
+
+            if column_table:
+                converted = True
+                column.replace(exp.Dot.build([exp.column(root, table=column_table), *parts]))
+
+    if converted:
+        # We want to re-aggregate the converted columns, otherwise they'd be skipped in
+        # a `for column in scope.columns` iteration, even though they shouldn't be
+        scope.clear_cache()
+
+
 def _qualify_columns(scope: Scope, resolver: Resolver) -> None:
     """Disambiguate columns, ensuring each column specifies a source"""
     for column in scope.columns:
@@ -347,30 +386,10 @@ def _qualify_columns(scope: Scope, resolver: Resolver) -> None:
                 column.set("table", exp.to_identifier(scope.pivots[0].alias))
                 continue
 
-            column_table = resolver.get_table(column_name)
-
             # column_table can be a '' because bigquery unnest has no table alias
+            column_table = resolver.get_table(column_name)
             if column_table:
                 column.set("table", column_table)
-        elif column_table not in scope.sources and (
-            not scope.parent
-            or column_table not in scope.parent.sources
-            or not scope.is_correlated_subquery
-        ):
-            # structs are used like tables (e.g. "struct"."field"), so they need to be qualified
-            # separately and represented as dot(dot(...(<table>.<column>, field1), field2, ...))
-
-            root, *parts = column.parts
-
-            if root.name in scope.sources:
-                # struct is already qualified, but we still need to change the AST representation
-                column_table = root
-                root, *parts = parts
-            else:
-                column_table = resolver.get_table(root.name)
-
-            if column_table:
-                column.replace(exp.Dot.build([exp.column(root, table=column_table), *parts]))
 
     for pivot in scope.pivots:
         for column in pivot.find_all(exp.Column):
